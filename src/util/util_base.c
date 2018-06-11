@@ -12,6 +12,7 @@
 #include <stdio.h>     // For vfprintf
 #include <stdarg.h>    // For va_list, va_start, va_end
 #include <string.h>    // for strstr
+#include "sicm_low.h"
 
 /****************************************************************************/
 
@@ -170,8 +171,19 @@ util_malloc( const char * err,
   // A do nothing request
   if( n==0 ) { *(char **)mem_ref = NULL; return; }
 
+  static int sicm_initialized = 0;
+  static sicm_arena *arena;
+  if (!sicm_initialized) {
+      sicm_device_list devs = sicm_init();
+      sicm_device *dev = &devs.devices[0];
+      if (!(arena = sicm_arena_create(0, dev))) {
+          ERROR(( err, (unsigned long)n ));
+      }
+      sicm_initialized = 1;
+  }
+
   // Allocate the memory ... abort if the allocation fails
-  mem = (char *)malloc(n);
+  mem = (char *)sicm_arena_alloc(arena, n);
   if( !mem ) ERROR(( err, (unsigned long)n ));
   *(char **)mem_ref = mem;
 }
@@ -181,7 +193,7 @@ util_free( void * mem_ref ) {
   char * mem;
   if( !mem_ref ) return;
   mem = *(char **)mem_ref;
-  if( mem ) free( mem );
+  if( mem ) sicm_free(mem);
   *(char **)mem_ref = NULL;
 }
 
@@ -264,4 +276,3 @@ _nanodelay( uint32_t i ) {
   for( ; i; i-- ) a^=0xdeadbeef, a>>=1;
   return a;
 }
-
