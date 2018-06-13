@@ -157,26 +157,25 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 }
 
 static void * use_sicm(const size_t n) {
-  static int sicm_initialized = 0;
+  static const sicm_device_tag type = SICM_DRAM;
   static sicm_arena *arena = NULL;
-  if (!sicm_initialized) {
-      sicm_device_list devs = sicm_init();
-      sicm_device *dev = NULL;
-      for(size_t i = 0; i < devs.count; i++) {
-        if (devs.devices[i].tag == SICM_DRAM) {
-          dev = &devs.devices[i];
-          break;
-        }
-      }
-      if (!dev) {
-        ERROR(( "Failed to find device" ));
-      }
 
-      if (!(arena = sicm_arena_create(0, dev))) {
+  if (!arena) {
+    sicm_device_list devs = sicm_init();
+    sicm_device *dev = NULL;
+    for(size_t i = 0; i < devs.count; i++) {
+      if (devs.devices[i].tag == type) {
+        dev = &devs.devices[i];
+        break;
+      }
+    }
+    if (!dev) {
+      ERROR(( "Failed to find device" ));
+    }
+
+    if (!(arena = sicm_arena_create(0, dev))) {
         ERROR(( "Failed to create arena" ));
-      }
-
-      sicm_initialized = 1;
+    }
   }
 
   return sicm_arena_alloc(arena, n);;
