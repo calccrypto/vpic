@@ -156,6 +156,32 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 
 }
 
+static void * use_sicm(const size_t n) {
+  static int sicm_initialized = 0;
+  static sicm_arena *arena = NULL;
+  if (!sicm_initialized) {
+      sicm_device_list devs = sicm_init();
+      sicm_device *dev = NULL;
+      for(size_t i = 0; i < devs.count; i++) {
+        if (devs.devices[i].tag == SICM_DRAM) {
+          dev = &devs.devices[i];
+          break;
+        }
+      }
+      if (!dev) {
+        ERROR(( "Failed to find device" ));
+      }
+
+      if (!(arena = sicm_arena_create(0, dev))) {
+        ERROR(( "Failed to create arena" ));
+      }
+
+      sicm_initialized = 1;
+  }
+
+  return sicm_arena_alloc(arena, n);;
+}
+
 void
 util_malloc( const char * err,
              void * mem_ref,
@@ -171,19 +197,8 @@ util_malloc( const char * err,
   // A do nothing request
   if( n==0 ) { *(char **)mem_ref = NULL; return; }
 
-  static int sicm_initialized = 0;
-  static sicm_arena *arena;
-  if (!sicm_initialized) {
-      sicm_device_list devs = sicm_init();
-      sicm_device *dev = &devs.devices[0];
-      if (!(arena = sicm_arena_create(0, dev))) {
-          ERROR(( err, (unsigned long)n ));
-      }
-      sicm_initialized = 1;
-  }
-
   // Allocate the memory ... abort if the allocation fails
-  mem = (char *)sicm_arena_alloc(arena, n);
+  mem = (char *)use_sicm(n);
   if( !mem ) ERROR(( err, (unsigned long)n ));
   *(char **)mem_ref = mem;
 }
@@ -228,7 +243,7 @@ util_malloc_aligned( const char * err,
   a--;
 
   // Allocate the raw unaligned memory.  Abort if the allocation fails.
-  mem_u = (char *) malloc( n + a + sizeof(char *) );
+  mem_u = (char *)use_sicm( n + a + sizeof(char *) );
 
   if ( !mem_u )
     ERROR( ( err, (unsigned long) n, (unsigned long) a ) );
@@ -254,7 +269,7 @@ util_free_aligned( void * mem_ref ) {
   if( mem_a ) {
     mem_p = (char **)(mem_a - sizeof(char *));
     mem_u = mem_p[0];
-    free( mem_u );
+    sicm_free(mem_u);
   }
   *(char **)mem_ref = NULL;
 }
