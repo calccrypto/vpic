@@ -159,7 +159,7 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 }
 
 static void * use_sicm(const size_t n) {
-  static const sicm_device_tag type = SICM_KNL_HBM;
+  static const sicm_device_tag type = SICM_DRAM;
   static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   static sicm_device **usable = NULL;
   static unsigned int count = 0;
