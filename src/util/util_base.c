@@ -12,7 +12,9 @@
 #include <stdio.h>     // For vfprintf
 #include <stdarg.h>    // For va_list, va_start, va_end
 #include <string.h>    // for strstr
-#include "sicm_low.h"
+#include <pthread.h>   // for pthread_mutex_t
+#include "sicm_low.h"  // for SICM
+#include <numa.h>      // for numa_node_size64
 
 /****************************************************************************/
 
@@ -157,28 +159,107 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 }
 
 static void * use_sicm(const size_t n) {
-  static const sicm_device_tag type = SICM_DRAM;
+  static const sicm_device_tag type = SICM_KNL_HBM;
+  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  static sicm_device **usable = NULL;
+  static unsigned int count = 0;
+  static unsigned int selected = 0;
   static sicm_arena *arena = NULL;
+  void * ptr = NULL;
 
-  if (!arena) {
-    sicm_device_list devs = sicm_init();
-    sicm_device *dev = NULL;
-    for(size_t i = 0; i < devs.count; i++) {
-      if (devs.devices[i].tag == type) {
-        dev = &devs.devices[i];
-        break;
+  if (!usable) {
+    pthread_mutex_lock(&mutex);
+    if (!usable) {
+      // get available devices matching desired type
+      sicm_device_list devs = sicm_init();
+      usable = calloc(devs.count, sizeof(sicm_device *));
+      count = 0;
+      for(unsigned int i = 0; i < devs.count; i++) {
+        if (devs.devices[i].tag == type) {
+          usable[count++] = &devs.devices[i];
+        }
+      }
+
+      if (!count) {
+          ERROR(( "Could not find any suitable devices of type %d", (int) type ));
+      }
+
+      MESSAGE(("found %u suitable devices", count));
+
+      // start at the first device;
+      if (!(arena = sicm_arena_create(0, usable[selected = 0]))) {
+        ERROR(( "Failed to create new arena on the same device" ));
       }
     }
-    if (!dev) {
-      ERROR(( "Failed to find device" ));
+    pthread_mutex_unlock(&mutex);
+  }
+
+
+  long long fr;
+  numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
+  MESSAGE(( "Attempting to allocate %zu bytes on numa node %u (%lld bytes free)", n, usable[selected]->data.knl_hbm.node, fr ));
+
+  unsigned int attempt = 1;
+
+  // try to allocate in the arena of the selected device
+  if ((ptr = sicm_arena_alloc(arena, n))) {
+    MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
+    return ptr;
+  }
+
+  pthread_mutex_lock(&mutex);
+
+  // attempt to allocate in a new arena on the selected device
+  // if that still doesn't work, try the devices that come after the selected one
+  for(int i = selected; i < count; i++) {
+    WARNING(( "Failed to allocate %d bytes on device index %u numa node %u with %lld bytes free (attempt %u)", n, i, usable[i]->data.knl_hbm.node, fr, attempt));
+    attempt++;
+
+    // try to create another arena on the same device
+    if (!(arena = sicm_arena_create(0, usable[i]))) {
+      pthread_mutex_unlock(&mutex);
+      ERROR(( "Failed to create new arena on device index %u", i ));
     }
 
-    if (!(arena = sicm_arena_create(0, dev))) {
-        ERROR(( "Failed to create arena" ));
+    selected = i;
+    MESSAGE(( "Allocated new arena on device index %u", selected ));
+
+    numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
+
+    // try to allocate on the new device
+    if ((ptr = sicm_arena_alloc(arena, n))) {
+      pthread_mutex_unlock(&mutex);
+      MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
+      return ptr;
     }
   }
 
-  return sicm_arena_alloc(arena, n);;
+  // search for a new device starting from the beginning, up to the selected device
+  for(unsigned int i = 0; i < selected; i++) {
+    WARNING(( "Failed to allocate %d bytes on device index %u numa node %u with %lld bytes free (attempt %u)", n, i, usable[i]->data.knl_hbm.node, fr, attempt));
+    attempt++;
+
+    // try to create another arena on the same device
+    if (!(arena = sicm_arena_create(0, usable[i]))) {
+      pthread_mutex_unlock(&mutex);
+      ERROR(( "Failed to create new arena on device index %u", i ));
+    }
+
+    selected = i;
+    MESSAGE(( "Allocated new arena on device index %u", selected ));
+
+    numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
+
+    // try to allocate on the new device
+    if ((ptr = sicm_arena_alloc(arena, n))) {
+      pthread_mutex_unlock(&mutex);
+      MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
+      return ptr;
+    }
+  }
+
+  pthread_mutex_unlock(&mutex);
+  return NULL;
 }
 
 void
