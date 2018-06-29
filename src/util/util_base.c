@@ -159,107 +159,97 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 }
 
 static void * use_sicm(const size_t n) {
-  static const sicm_device_tag type = SICM_DRAM;
-  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-  static sicm_device **usable = NULL;
-  static unsigned int count = 0;
+  static const sicm_device_tag preferences[] = {SICM_KNL_HBM, SICM_DRAM};
+  static const unsigned int preference_count = sizeof(preferences) / sizeof(sicm_device_tag);
+  static unsigned int pref;
+  static sicm_device_list devs = {};
   static unsigned int selected = 0;
   static sicm_arena *arena = NULL;
-  void * ptr = NULL;
 
-  if (!usable) {
-    pthread_mutex_lock(&mutex);
-    if (!usable) {
-      // get available devices matching desired type
-      sicm_device_list devs = sicm_init();
-      usable = calloc(devs.count, sizeof(sicm_device *));
-      count = 0;
-      for(unsigned int i = 0; i < devs.count; i++) {
-        if (devs.devices[i].tag == type) {
-          usable[count++] = &devs.devices[i];
+  // only happens at init
+  if (!devs.count) {
+    devs = sicm_init();
+
+    // find first preference that has a device
+    int found = 0;
+    for(pref = 0; pref < preference_count; pref++) {
+      for(unsigned int j = 0; j < devs.count; j++) {
+        if (devs.devices[j].tag == preferences[pref]) {
+          found = 1;
+          selected = j;
+          MESSAGE(( "Starting at preference %u", pref ));
+          break;
         }
       }
 
-      if (!count) {
-          ERROR(( "Could not find any suitable devices of type %d", (int) type ));
-      }
-
-      MESSAGE(("found %u suitable devices", count));
-
-      // start at the first device;
-      if (!(arena = sicm_arena_create(0, usable[selected = 0]))) {
-        ERROR(( "Failed to create new arena on the same device" ));
+      if (found) {
+          break;
       }
     }
-    pthread_mutex_unlock(&mutex);
-  }
 
-
-  long long fr;
-  numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
-  MESSAGE(( "Attempting to allocate %zu bytes on numa node %u (%lld bytes free)", n, usable[selected]->data.knl_hbm.node, fr ));
-
-  unsigned int attempt = 1;
-
-  // try to allocate in the arena of the selected device
-  if ((ptr = sicm_arena_alloc(arena, n))) {
-    MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
-    return ptr;
-  }
-
-  pthread_mutex_lock(&mutex);
-
-  // attempt to allocate in a new arena on the selected device
-  // if that still doesn't work, try the devices that come after the selected one
-  for(int i = selected; i < count; i++) {
-    WARNING(( "Failed to allocate %d bytes on device index %u numa node %u with %lld bytes free (attempt %u)", n, i, usable[i]->data.knl_hbm.node, fr, attempt));
-    attempt++;
-
-    // try to create another arena on the same device
-    if (!(arena = sicm_arena_create(0, usable[i]))) {
-      pthread_mutex_unlock(&mutex);
-      ERROR(( "Failed to create new arena on device index %u", i ));
+    if (!found) {
+      ERROR(( "Could not find device that matches any listed preference" ));
     }
 
-    selected = i;
-    MESSAGE(( "Allocated new arena on device index %u", selected ));
-
-    numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
-
-    // try to allocate on the new device
-    if ((ptr = sicm_arena_alloc(arena, n))) {
-      pthread_mutex_unlock(&mutex);
-      MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
-      return ptr;
-    }
+    // create an arena on the selected device (ignore error)
+    arena = sicm_arena_create(0, &devs.devices[selected]);
   }
 
-  // search for a new device starting from the beginning, up to the selected device
-  for(unsigned int i = 0; i < selected; i++) {
-    WARNING(( "Failed to allocate %d bytes on device index %u numa node %u with %lld bytes free (attempt %u)", n, i, usable[i]->data.knl_hbm.node, fr, attempt));
-    attempt++;
+  // try to allocate
+  void *ptr = sicm_arena_alloc(arena, n);
 
-    // try to create another arena on the same device
-    if (!(arena = sicm_arena_create(0, usable[i]))) {
-      pthread_mutex_unlock(&mutex);
-      ERROR(( "Failed to create new arena on device index %u", i ));
-    }
+  if (!ptr) {
+    // if the allocation fails, try all of the devices, according to preference
+    for(; pref < preference_count && !ptr; pref++) {
+      // cycle through devices starting from the previously selected device
+      // another arena is created on the previously selected device before moving to the next device
+      for(unsigned int i = selected; i < devs.count && !ptr; i++) {
+        if (devs.devices[i].tag == preferences[pref]) {
+          if (!(arena = sicm_arena_create(0, &devs.devices[i]))) {
+            continue;
+          }
 
-    selected = i;
-    MESSAGE(( "Allocated new arena on device index %u", selected ));
+          selected = i;
 
-    numa_node_size64(usable[selected]->data.knl_hbm.node, &fr);
+          if (!(ptr = sicm_arena_alloc(arena, n))) {
+            continue;
+          }
+        }
+      }
 
-    // try to allocate on the new device
-    if ((ptr = sicm_arena_alloc(arena, n))) {
-      pthread_mutex_unlock(&mutex);
-      MESSAGE(( "Allocated %zu bytes on device index %u (attempt %u)", n, selected, attempt ));
-      return ptr;
+      // if no devices worked, cycle through the devices from the beginning, up to the previously selected device
+      for(unsigned int i = 0; i < selected && !ptr; i++) {
+        if (devs.devices[i].tag == preferences[pref]) {
+          if (!(arena = sicm_arena_create(0, &devs.devices[i]))) {
+            continue;
+          }
+
+          selected = i;
+
+          if (!(ptr = sicm_arena_alloc(arena, n))) {
+            continue;
+          }
+        }
+      }
+
+      if (ptr) {
+        break;
+      }
+
+      WARNING(( "Could not find suitable device with preference %u", pref ));
     }
   }
 
-  pthread_mutex_unlock(&mutex);
-  return NULL;
+  if (ptr) {
+      int node = -1;
+      numa_move_pages(0, 1, &ptr, NULL, &node, 0);
+      MESSAGE(( "Allocated %zu bytes on device %d (preferrence %u)", n, node, pref ));
+  }
+  else {
+      WARNING(( "Failed to allocate %zu bytes", n ));
+  }
+
+  return ptr;
 }
 
 void
