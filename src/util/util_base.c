@@ -159,94 +159,79 @@ void detect_old_style_arguments(int* pargc, char *** pargv)
 }
 
 static void * use_sicm(const size_t n) {
-  static const sicm_device_tag preferences[] = {SICM_KNL_HBM, SICM_DRAM};
-  static const unsigned int preference_count = sizeof(preferences) / sizeof(sicm_device_tag);
-  static unsigned int pref;
   static sicm_device_list devs = {};
+  static sicm_device **usable = NULL;
+  static unsigned int usable_count = 0;
   static unsigned int selected = 0;
   static sicm_arena *arena = NULL;
 
   // only happens at init
-  if (!devs.count) {
+  if (!usable) {
     devs = sicm_init();
 
-    // find first preference that has a device
-    int found = 0;
-    for(pref = 0; pref < preference_count; pref++) {
-      for(unsigned int j = 0; j < devs.count; j++) {
-        if (devs.devices[j].tag == preferences[pref]) {
-          found = 1;
-          selected = j;
-          MESSAGE(( "Starting at preference %u", pref ));
-          break;
-        }
-      }
+    // get number of usable devices in order of preference
+    static const sicm_device_tag preferences[] = {SICM_KNL_HBM, SICM_DRAM};
+    static const unsigned int preference_count = sizeof(preferences) / sizeof(sicm_device_tag);
 
-      if (found) {
-          break;
+    if (!(usable = malloc(devs.count * sizeof(struct sicm_device *)))) {
+      ERROR(( "Unable to allocate space for keeping track of usable devices" ));
+    }
+
+    // store usable devices in order of preference
+    usable_count = 0;
+    for(unsigned int p = 0; p < preference_count; p++) {
+      for(unsigned int d = 0; d < devs.count; d++) {
+        if (devs.devices[d].tag == preferences[p]) {
+          usable[d] = &devs.devices[d];
+          usable_count++;
+        }
       }
     }
 
-    if (!found) {
-      ERROR(( "Could not find device that matches any listed preference" ));
+    if (!usable_count) {
+      ERROR(( "Unable to find any devices with the given preferences" ));
     }
 
     // create an arena on the selected device (ignore error)
-    arena = sicm_arena_create(0, &devs.devices[selected]);
+    arena = sicm_arena_create(0, &devs.devices[selected = 0]);
   }
 
   // try to allocate
+  // If the allocation fails, try all of the devices, starting from the currently
+  // selected device until memory is allocated or the devices run out.
+  // This assumes that memory used in previously used devices is never deallocated.
   void *ptr = sicm_arena_alloc(arena, n);
-
   if (!ptr) {
-    // if the allocation fails, try all of the devices, according to preference
-    for(; pref < preference_count && !ptr; pref++) {
-      // cycle through devices starting from the previously selected device
-      // another arena is created on the previously selected device before moving to the next device
-      for(unsigned int i = selected; i < devs.count && !ptr; i++) {
-        if (devs.devices[i].tag == preferences[pref]) {
-          if (!(arena = sicm_arena_create(0, &devs.devices[i]))) {
-            continue;
-          }
+    WARNING(( "Failed to allocate using old arena in device index %u (%s).", selected, sicm_device_tag_str(usable[selected]->tag) ));
 
-          selected = i;
-
-          if (!(ptr = sicm_arena_alloc(arena, n))) {
-            continue;
-          }
-        }
+    // another arena is created on the previously selected device before moving to the next device
+    unsigned int i = selected;
+    for(; i < usable_count; i++) {
+      if (!(arena = sicm_arena_create(0, usable[i]))) {
+        continue;
       }
 
-      // if no devices worked, cycle through the devices from the beginning, up to the previously selected device
-      for(unsigned int i = 0; i < selected && !ptr; i++) {
-        if (devs.devices[i].tag == preferences[pref]) {
-          if (!(arena = sicm_arena_create(0, &devs.devices[i]))) {
-            continue;
-          }
-
-          selected = i;
-
-          if (!(ptr = sicm_arena_alloc(arena, n))) {
-            continue;
-          }
-        }
-      }
-
-      if (ptr) {
+      if ((ptr = sicm_arena_alloc(arena, n))) {
+        selected = i;
+        MESSAGE(( "Allocated %zu bytes in new arena on device index %u", n, selected ));
         break;
       }
+    }
 
-      WARNING(( "Could not find suitable device with preference %u", pref ));
+    // if there are no more devices to choose from, always fail
+    if (i == usable_count) {
+      selected = usable_count;
+      arena = NULL;
     }
   }
 
   if (ptr) {
-      int node = -1;
-      numa_move_pages(0, 1, &ptr, NULL, &node, 0);
-      MESSAGE(( "Allocated %zu bytes on device %d (preferrence %u)", n, node, pref ));
+    int node = -1;
+    numa_move_pages(0, 1, &ptr, NULL, &node, 0);
+    MESSAGE(( "Allocated %zu bytes on numa node %u (%s)", n, node, sicm_device_tag_str(usable[selected]->tag) ));
   }
   else {
-      WARNING(( "Failed to allocate %zu bytes", n ));
+    WARNING(( "Failed to allocate %zu bytes", n));
   }
 
   return ptr;
